@@ -60,6 +60,8 @@ export function createApp() {
     "https://dh-front-vvwx.onrender.com",
     "https://terminal-workplace.com",
     "terminal-workplace.com",
+    "https://dh-new-back.onrender.com",
+    "https://dh-new.onrender.com",
     
     process.env.FRONTEND_URL,      // Allowed frontend URL from env
   ].filter(Boolean);
