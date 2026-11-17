@@ -1,24 +1,63 @@
 // cron/autoLoginCron.js
 // Scheduled auto-login for Kite Connect
-// Runs daily at 7:55 AM IST (before market opens at 9:15 AM)
+// Runs daily before market opens to ensure fresh token every morning
 
 import cron from 'node-cron';
 import { runAutoLogin, isAutoLoginConfigured } from '../services/AutoLoginService.js';
 import KiteCredential from '../Model/KiteCredentialModel.js';
 
 /**
+ * Helper to determine whether a token needs refresh.
+ * Zerodha invalidates tokens daily around 6:00 - 7:30 AM IST.
+ * If current time is past 7:00 AM IST and the last login was before 7:00 AM IST today,
+ * the token is stale/expired and MUST be refreshed.
+ */
+export function shouldRefreshToken(credential) {
+    if (!credential || !credential.access_token) return true;
+
+    const now = new Date();
+
+    // Check explicit token expiry if already in the past
+    if (credential.token_expiry && new Date(credential.token_expiry) <= now) {
+        return true;
+    }
+
+    // Check IST time
+    const istString = now.toLocaleString("en-US", { timeZone: "Asia/Kolkata" });
+    const istDate = new Date(istString);
+    const istHour = istDate.getHours();
+
+    const lastLogin = credential.last_auto_login || credential.login_time;
+    if (!lastLogin) return true;
+
+    const lastLoginIST = new Date(new Date(lastLogin).toLocaleString("en-US", { timeZone: "Asia/Kolkata" }));
+
+    // Is last login from an earlier day?
+    const isSameDate = (
+        istDate.getFullYear() === lastLoginIST.getFullYear() &&
+        istDate.getMonth() === lastLoginIST.getMonth() &&
+        istDate.getDate() === lastLoginIST.getDate()
+    );
+
+    // If it's 7:00 AM IST or later, we must have logged in TODAY at or after 7:00 AM IST
+    if (istHour >= 7) {
+        if (!isSameDate) return true;
+        if (lastLoginIST.getHours() < 7) return true;
+    }
+
+    return false;
+}
+
+/**
  * Start the auto-login cron job
- * Runs at 7:55 AM IST every day to ensure fresh token before market opens
+ * Runs at 8:00 AM IST daily (and backup check at 8:45 AM IST)
+ * to ensure fresh token before market opens at 9:15 AM
  */
 export function startAutoLoginCron() {
-    // Schedule: 55 7 * * * = At 7:55 AM every day
-    // IST is UTC+5:30, so 7:55 AM IST = 2:25 AM UTC
-    const schedule = '25 2 * * *'; // 2:25 AM UTC = 7:55 AM IST
+    console.log('[AutoLoginCron] 📅 Scheduling daily auto-login (8:00 AM & 8:45 AM IST)');
 
-    console.log('[AutoLoginCron] 📅 Scheduling daily auto-login at 7:55 AM IST');
-
-    cron.schedule(schedule, async () => {
-        console.log('[AutoLoginCron] ⏰ Cron triggered at', new Date().toISOString());
+    const runMorningAutoLogin = async (triggerName) => {
+        console.log(`[AutoLoginCron] ⏰ ${triggerName} triggered at`, new Date().toISOString());
 
         try {
             // Check if auto-login is configured and enabled
@@ -34,19 +73,11 @@ export function startAutoLoginCron() {
                 return;
             }
 
-            // Check if token is still valid
+            // Check if token is still valid from today after 7 AM
             const credential = await KiteCredential.getActive(true);
-            if (credential?.token_expiry) {
-
-                const expiry = new Date(credential.token_expiry);
-                const now = new Date();
-                const hoursRemaining = (expiry - now) / (1000 * 60 * 60);
-
-                // If token is still valid for more than 2 hours, skip
-                if (hoursRemaining > 2) {
-                    console.log(`[AutoLoginCron] Token still valid for ${hoursRemaining.toFixed(1)} hours. Skipping.`);
-                    return;
-                }
+            if (credential && !shouldRefreshToken(credential)) {
+                console.log('[AutoLoginCron] ✅ Fresh token already exists for today. Skipping.');
+                return;
             }
 
             // Run auto-login
@@ -64,11 +95,19 @@ export function startAutoLoginCron() {
         } catch (error) {
             console.error('[AutoLoginCron] ❌ Error:', error.message);
         }
-    }, {
+    };
+
+    // Primary: 8:00 AM IST every day
+    cron.schedule('0 8 * * *', () => runMorningAutoLogin('Morning 8:00 AM IST job'), {
         timezone: 'Asia/Kolkata'
     });
 
-    console.log('[AutoLoginCron] ✅ Cron job registered');
+    // Backup check: 8:45 AM IST every day (before 9:15 AM market open)
+    cron.schedule('45 8 * * *', () => runMorningAutoLogin('Backup 8:45 AM IST check'), {
+        timezone: 'Asia/Kolkata'
+    });
+
+    console.log('[AutoLoginCron] ✅ Cron jobs registered (8:00 AM & 8:45 AM IST)');
 }
 
 /**
@@ -88,25 +127,18 @@ export async function checkAndRefreshOnStartup() {
         const credential = await KiteCredential.getActive(true);
 
         if (!credential) {
-
             console.log('[AutoLoginCron] No active credentials found');
             return;
         }
 
-        // Check token expiry
-        if (credential.token_expiry) {
-            const expiry = new Date(credential.token_expiry);
-            const now = new Date();
-
-            if (expiry > now) {
-                const hoursRemaining = (expiry - now) / (1000 * 60 * 60);
-                console.log(`[AutoLoginCron] Token valid for ${hoursRemaining.toFixed(1)} more hours`);
-                return;
-            }
+        // Check if token needs refresh
+        if (!shouldRefreshToken(credential)) {
+            console.log('[AutoLoginCron] Token is still fresh and valid.');
+            return;
         }
 
-        // Token expired or no expiry set - try auto-login
-        console.log('[AutoLoginCron] Token expired. Running auto-login...');
+        // Token expired or invalid - run auto-login
+        console.log('[AutoLoginCron] Token needs refresh. Running startup auto-login...');
         const result = await runAutoLogin();
 
         if (result.success) {
@@ -120,4 +152,4 @@ export async function checkAndRefreshOnStartup() {
     }
 }
 
-export default { startAutoLoginCron, checkAndRefreshOnStartup };
+export default { startAutoLoginCron, checkAndRefreshOnStartup, shouldRefreshToken };

@@ -88,6 +88,9 @@ export class KiteWebSocket {
       this.isConnected = true;
       this.reconnectAttempts = 0; // Reset on successful connection
 
+      // Re-subscribe all active tokens on every connect/reconnect!
+      this.resubscribeAll();
+
       // Process queued subscriptions
       if (this.subscriptionQueue.length > 0) {
         console.log(`[KiteWS] Processing ${this.subscriptionQueue.length} queued subscriptions`);
@@ -118,7 +121,8 @@ export class KiteWebSocket {
 
       // Check for authentication errors (403, token expired, etc.)
       if (errorMsg.includes('403') || errorMsg.includes('Forbidden') ||
-        errorMsg.includes('token') || errorMsg.includes('unauthorized')) {
+        errorMsg.includes('token') || errorMsg.includes('unauthorized') ||
+        errorMsg.includes('Unexpected server response: 403')) {
         console.error("[KiteWS] ⚠️ Authentication error detected - will attempt auto-login");
         this.handleAuthError();
       }
@@ -147,8 +151,14 @@ export class KiteWebSocket {
 
     // On close
     this.ticker.on('close', (reason) => {
-      console.warn("[KiteWS] Connection closed:", reason?.code || reason);
+      const reasonStr = String(reason?.code || reason?.reason || reason || '');
+      console.warn("[KiteWS] Connection closed:", reasonStr);
       this.isConnected = false;
+
+      if (reasonStr.includes('403') || reasonStr.includes('Forbidden')) {
+        console.error("[KiteWS] ⚠️ Connection closed due to 403 Forbidden - will attempt auto-login");
+        this.handleAuthError();
+      }
     });
 
     // On raw message (optional - for debugging)
@@ -158,9 +168,37 @@ export class KiteWebSocket {
   }
 
   /**
+   * Re-subscribes all previously tracked tokens upon connect or reconnect
+   */
+  resubscribeAll() {
+    if (!this.ticker || !this.isConnected) return;
+
+    const tokens = Array.from(this.subscribedTokens)
+      .map(t => parseInt(t))
+      .filter(t => !isNaN(t) && t > 0);
+
+    if (tokens.length > 0) {
+      console.log(`[KiteWS] 🔄 Re-subscribing to ${tokens.length} active tokens on connected ticker`);
+      try {
+        this.ticker.subscribe(tokens);
+        this.ticker.setMode(this.ticker.modeFull, tokens);
+        console.log(`[KiteWS] ✅ Successfully re-subscribed ${tokens.length} tokens (modeFull)`);
+      } catch (err) {
+        console.error("[KiteWS] ❌ Re-subscribe failed:", err?.message || err);
+      }
+    }
+  }
+
+  /**
    * Handle authentication errors by triggering auto-login
    */
   async handleAuthError() {
+    if (this.isHandlingAuthError) {
+      console.log("[KiteWS] Auth recovery already running. Skipping duplicate call.");
+      return;
+    }
+    this.isHandlingAuthError = true;
+
     try {
       console.log("[KiteWS] 🔐 Attempting auto-login due to auth error...");
 
@@ -174,11 +212,13 @@ export class KiteWebSocket {
       } else {
         console.error("[KiteWS] ❌ Auto-login failed:", result.error);
         // Schedule another attempt later
-        this.scheduleRecovery(300000); // 5 minutes
+        this.scheduleRecovery(180000); // 3 minutes
       }
     } catch (error) {
       console.error("[KiteWS] Error during auth recovery:", error.message);
-      this.scheduleRecovery(300000); // 5 minutes
+      this.scheduleRecovery(180000); // 3 minutes
+    } finally {
+      this.isHandlingAuthError = false;
     }
   }
 
@@ -203,6 +243,13 @@ export class KiteWebSocket {
    */
   async reconnectWithNewCredentials() {
     try {
+      console.log("[KiteWS] 🔄 Reconnecting with fresh credentials from database...");
+
+      if (this.recoveryTimeout) {
+        clearTimeout(this.recoveryTimeout);
+        this.recoveryTimeout = null;
+      }
+
       // Close existing connection if any
       if (this.ticker) {
         try {
@@ -216,10 +263,9 @@ export class KiteWebSocket {
       this.isConnected = false;
 
       // Wait a bit before reconnecting
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 1500));
 
       // Connect with fresh credentials
-      console.log("[KiteWS] 🔄 Connecting with fresh credentials...");
       await this.connect();
 
     } catch (error) {
@@ -267,19 +313,20 @@ export class KiteWebSocket {
   }
 
   subscribeTokens(tokens, mode = 'full') {
-    // 1. Filter new tokens that need subscription
-    const newTokens = tokens.filter(t => !this.subscribedTokens.has(t));
+    if (!tokens || !tokens.length) return;
+
+    // Always remember tokens in this.subscribedTokens
+    tokens.forEach(token => this.subscribedTokens.add(token));
+
+    if (!this.isConnected || !this.ticker) {
+      this.subscriptionQueue.push({ tokens, mode });
+      return;
+    }
 
     try {
-      // Subscribe to NEW tokens only
-      if (newTokens.length > 0) {
-        console.log(`[KiteWS] Subscribing to ${newTokens.length} new tokens`);
-        this.ticker.subscribe(newTokens);
-        newTokens.forEach(token => this.subscribedTokens.add(token));
-      }
+      // Send subscription to Kite
+      this.ticker.subscribe(tokens);
 
-      // 2. ALWAYS set mode for ALL requested tokens (to allow upgrades/downgrades)
-      // This fixes the issue where upgrading 'quote' -> 'full' was ignored if already subscribed
       const modeMap = {
         'ltp': this.ticker.modeLTP,
         'quote': this.ticker.modeQuote,
@@ -287,11 +334,8 @@ export class KiteWebSocket {
       };
       const tickerMode = modeMap[mode] || this.ticker.modeFull;
 
-      // Only set mode if there are tokens to set
-      if (tokens.length > 0) {
-        this.ticker.setMode(tickerMode, tokens);
-        console.log(`[KiteWS] Set mode '${mode}' for ${tokens.length} tokens`);
-      }
+      this.ticker.setMode(tickerMode, tokens);
+      console.log(`[KiteWS] Subscribed & set mode '${mode}' for ${tokens.length} tokens (Total tracked: ${this.subscribedTokens.size})`);
     } catch (error) {
       console.error("[KiteWS] Subscription error:", error?.message || error);
     }

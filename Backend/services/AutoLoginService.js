@@ -335,8 +335,19 @@ export async function runAutoLogin() {
             console.log('[AutoLogin] ✅ Database updated with new token');
             console.log('[AutoLogin]    Token expires:', expiry.toISOString());
 
-            // Note: WebSocket reconnection is handled by KiteWebSocket itself
-            // It will auto-detect the new token on next connection attempt
+            // Hot-reload live KiteWebSocket connection with new credentials
+            try {
+                const { getFeedInstance } = await import('./feedState.js');
+                const feed = getFeedInstance();
+                if (feed && typeof feed.reconnectWithNewCredentials === 'function') {
+                    console.log('[AutoLogin] 🔄 Triggering KiteWebSocket reconnect with new token...');
+                    feed.reconnectWithNewCredentials().catch(err => {
+                        console.error('[AutoLogin] KiteWebSocket reconnect error:', err?.message || err);
+                    });
+                }
+            } catch (feedErr) {
+                console.warn('[AutoLogin] Could not notify KiteWebSocket of token update:', feedErr?.message || feedErr);
+            }
 
             return {
                 success: true,
